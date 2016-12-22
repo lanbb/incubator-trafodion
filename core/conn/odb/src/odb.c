@@ -506,7 +506,8 @@ struct execute {
     char *sql;                  /* extract custom SQL */
     char *sb;                   /* extract split by column name, load=bad file */
     char *key[MAX_PK_COLS];     /* diff key column names */
-    char loadcmd[3];                /* load/copy=command to use INSERT/UPSERT/UPSERT USING LOAD, IN/UP/UL */ 
+    char loadcmd[3];            /* load/copy=command to use INSERT/UPSERT/UPSERT USING LOAD, IN/UP/UL */
+    char encryptkey[10];        /* extract/load with encryption key, we can set password less than 10 bytes */
 #ifdef XML
     char *xrt;                  /* load: xml row tag */
 #endif
@@ -13590,6 +13591,16 @@ static int Otcol(int eid, SQLHDBC *Ocn)
                     //etab[no].loadcmd = &str[l];
                     strncpy(etab[no].loadcmd, &str[l], 2);
                     etab[no].loadcmd[2] = '\0';
+                } else if ((type == 'e' || type == 'l') && !strcmp(&str[n], "encryptkey")) {
+                    if (strlen(&str[l]) > 10)
+                    {
+                        fprintf(stderr, "odb [parseopt(%d)] - Error: encryptkey should be less than 10 bytes, password set \"%s\"\n",
+                            __LINE__, &str[l]);
+                        no = tn = 0;        /* reset tn */
+                        return (1);
+                    }
+                    strncpy(etab[no].loadcmd, &str[l], strlen(&str[l]));
+                    etab[no].encryptkey[strlen(&str[l])] = '\0';
                 } else {
                     fprintf(stderr, "odb [parseopt(%d)] - Error: unknown parameter \"%s\"\n",
                         __LINE__, &str[n]);
