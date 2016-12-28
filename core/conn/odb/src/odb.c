@@ -68,6 +68,8 @@ char *odbauth = "Trafodion Dev <trafodion-development@lists.launchpad.net>";
 #define ENABLE_ZLIB_GZIP 32
 #define GZBUFF_LEN  262144      /* gzip write buffer length */
 
+#define ENCRYPT_MAX_LENGTH 1024
+
 #ifdef __CYGWIN__
     #undef WORD
     #include <windows.h>
@@ -140,6 +142,8 @@ char *odbauth = "Trafodion Dev <trafodion-development@lists.launchpad.net>";
     #define SIZET_SPEC "%zu"
     #include <pthread.h>
     #include <strings.h>
+    #include <openssl/evp.h>
+
     #ifdef __hpux
         #define Sleep(x) \
             if ( x > 1000 ) { \
@@ -507,7 +511,7 @@ struct execute {
     char *sb;                   /* extract split by column name, load=bad file */
     char *key[MAX_PK_COLS];     /* diff key column names */
     char loadcmd[3];            /* load/copy=command to use INSERT/UPSERT/UPSERT USING LOAD, IN/UP/UL */
-    char encryptkey[10];        /* extract/load with encryption key, we can set password less than 10 bytes */
+    char encryptkey[EVP_MAX_KEY_LENGTH];        /* extract/load with encryption key, we can set password less than 64 bytes */
 #ifdef XML
     char *xrt;                  /* load: xml row tag */
 #endif
@@ -702,6 +706,9 @@ static void tclean(void *tid);          /* Thread cleanup routine */
 #ifndef _WIN32
 static void tunlock(void *eid);         /* Thread cleanup routine */
 #endif
+
+static int AesEncryptFile (char * szSrc, char * szTarget, char * key, int iType);
+static int AesDecryptFile (char * szSrc, char * szTarget, char * key, int iType);
 static void gclean(void);               /* Global cleanup routine */
 static int Oloadbuff(int eid);
 static int Ocopy(int eid);
@@ -1543,6 +1550,7 @@ int main(int ac, char *av[])
             case 'L':
                 fprintf(stderr, "\tSource (.src): %s\n", etab[i].src);
                 fprintf(stderr, "\tTarget (.Ocso[0-2]): %s.%s.%s\n", etab[i].Ocso[0], etab[i].Ocso[1], etab[i].Ocso[2]);
+                fprintf(stderr, "\tEncryptkey (.encryptkey): %s\n", etab[i].encryptkey);
                 fprintf(stderr, "\tMap File (.map): %s\n", etab[i].map);
                 fprintf(stderr, "\tLines to skip (.k): %u\n", etab[i].k);
                 fprintf(stderr, "\tParallel Streams (.ps): %u\n", etab[i].ps);
@@ -1555,6 +1563,7 @@ int main(int ac, char *av[])
                 fprintf(stderr, "\tSQL extract (.sql): %s\n", etab[i].sql);
                 fprintf(stderr, "\tSource (.src): %s\n", etab[i].src);
                 fprintf(stderr, "\tTarget (.tgt): %s\n", etab[i].tgt);
+                fprintf(stderr, "\tEncryptkey (.encryptkey): %s\n", etab[i].encryptkey);
                 fprintf(stderr, "\tParallel Streams (.ps): %u\n", etab[i].ps);
                 fprintf(stderr, "\tPWhere Condition (.map): %s\n", etab[i].map);
                 fprintf(stderr, "\tSplit By (.sb): %s\n", etab[i].sb);
@@ -3066,7 +3075,8 @@ static int Oexec(int tid, int eid, int ten, int scn, SQLCHAR *Ocmd, char *label)
     char *ch,                   /* used to browse the field to print looking for char to escape */
          *os = 0,               /* output string pointer */
          *gzbuff = 0,           /* GZIP IO buffer */
-         *obuff=0;              /* output buffer pointer */
+         *obuff=0,              /* output buffer pointer */
+         *encrypt_obuff = 0;    /* encrypted output buffer pointer */
     char *p = 0 ;               /* loop variable */
     char q = 0,                 /* quote flag */
          buff[50],              /* to build command string for csv output */
@@ -3882,6 +3892,8 @@ Please note the fixed length '6' in strmicmp: SELECT/UPDATET/DELETE/INSERT have 
     /* Close & Free statement handle & Memory */
     if ( obuff )
         free ( obuff );
+    if ( encrypt_obuff )
+        free ( encrypt_obuff );
     if ( Oresp ) {
         for ( i = 0; i < Oncol ; i++) {
             if ( Oresp[i] )
@@ -6135,7 +6147,8 @@ static void Oload(int eid)
          z = 0,                 /* loop variable */
          t = 0,                 /* loop variable */
          gzret = 0,             /* zlib function return values */
-         ifl=0;                 /* input field length */
+         ifl=0,                 /* input field length */
+         ret = -1;               /* function return value */
     unsigned int nldr=0,        /* number of loaders */
                  p=0,           /* current position in the IO buffer */
                  k=0,           /* input file field number */
@@ -6180,6 +6193,7 @@ static void Oload(int eid)
          *bp = 0,               /* used to browse line read from mapfile */
          *str = 0,              /* field buffer */
          *sp = 0;               /* string pointer loop variable */
+
     struct m {                  /* Table Column Map */
         int min;                /* min value */
         int max;                /* max value */
@@ -6206,6 +6220,7 @@ static void Oload(int eid)
     time_t trnd;                /* to generate random time/timestamp(s) */
     char num[32];               /* Formatted Number String */
     char tim[15];               /* Formatted Time String */
+    char decrypt_file[ENCRYPT_MAX_LENGTH] = {0};     /* tmp file to store decrypted file */
     struct timeval tve;         /* timeval struct to define elapesd/timelines */
     SQLCHAR *Odp = 0;           /* rowset buffer data pointer */
     double seconds = 0;         /* seconds used for timings */
@@ -6354,6 +6369,21 @@ static void Oload(int eid)
             }
         }
         buff[j] = '\0';
+        
+        /* decrypt file first if set option "encryptkey" */
+        if ( strlen(etab[eid].encryptkey) > 0)
+        {
+            strcat(decrypt_file,  buff);
+            strcat(decrypt_file, "_decrypted");
+            ret = AesDecryptFile(buff, decrypt_file, etab[eid].encryptkey, 128);
+            if ( ret != 0 )
+            {
+                printf("decrypt failed\n");
+                goto oload_exit;
+            }
+            strcpy(buff, decrypt_file);
+        }
+
         if ( !(etab[eid].flg2 & 0100) ) {   /* No HDFS input file */
             if ( ( fl = fopen(buff, "r") ) == (FILE *) NULL ) {
                 fprintf(stderr, "odb [Oload(%d)] - Error opening input file %s: [%d] %s\n",
@@ -7866,6 +7896,16 @@ static void Oload(int eid)
             (void)Oexec(tid, eid, 0, 0, (SQLCHAR *)etab[eid].post, "");
         etab[eid].flg2 &= ~020000000 ;          /* reset Oexec to allocate/use its own handle */
     }
+
+    /* remove decrypted file */
+    if ( strlen(etab[eid].encryptkey) > 0)
+    {
+        if (!access(decrypt_file, F_OK))
+        {
+            remove(decrypt_file);
+        }
+    }
+
     return;
 }
 
@@ -9607,6 +9647,7 @@ static void Oextract(int eid)
     int tid = etab[eid].id;     /* Thread ID */
     char num[32];               /* to build formatted numbers */
     char tim[15];               /* formatted time string */
+    char encrypt_file[ENCRYPT_MAX_LENGTH] = {0};     /* tmp file to store encrypted file */
     char *xbuff = 0;            /* buffer allocated for XML output */
     size_t xbuffl = 33 + MAXOBJ_LEN * 3 ;   /* xmlbuff length */
     SQLCHAR *Ocmd = 0;          /* ODBC Command buffer */
@@ -9618,6 +9659,7 @@ static void Oextract(int eid)
     int i = 0;                  /* loop variable */
     int cmdl = 0;               /* Ocmd length */
     int gpar = etab[eid].k;     /* grand parent eid */
+    int ret = 0;                /* function return */
     unsigned long b = 0;        /* total number of bytes written by "pool" */
     unsigned long nr = 0;       /* total number of recs written by "pool" */
     double seconds = 0;         /* seconds used for timings */
@@ -9887,6 +9929,22 @@ static void Oextract(int eid)
             if ( etab[eid].fo && etab[eid].fo != stdout ) 
                 fclose ( etab[eid].fo );
         }
+
+        if ( strlen(etab[eid].encryptkey) > 0)
+        {
+            strcat(encrypt_file,  etab[eid].tgt);
+            strcat(encrypt_file, "_encrypted");
+            ret = AesEncryptFile(etab[eid].tgt, encrypt_file, etab[eid].encryptkey, 128);
+            if ( ret != 0 )
+            {
+                printf("encrypt failed\n");
+                goto oextract_exit;
+            }
+
+            remove(etab[eid].tgt);
+            rename(encrypt_file, etab[eid].tgt);
+        }
+
         /* Print stats */
         if ( etab[eid].flg2 & 04000000 ) {  /* initialize XML output buffer */
             xbuffl = snprintf(xbuff, xbuffl, "\n<%s>\n",
@@ -13592,14 +13650,14 @@ static int Otcol(int eid, SQLHDBC *Ocn)
                     strncpy(etab[no].loadcmd, &str[l], 2);
                     etab[no].loadcmd[2] = '\0';
                 } else if ((type == 'e' || type == 'l') && !strcmp(&str[n], "encryptkey")) {
-                    if (strlen(&str[l]) > 10)
+                    if (strlen(&str[l]) > EVP_MAX_KEY_LENGTH)
                     {
-                        fprintf(stderr, "odb [parseopt(%d)] - Error: encryptkey should be less than 10 bytes, password set \"%s\"\n",
+                        fprintf(stderr, "odb [parseopt(%d)] - Error: encryptkey should be less than EVP_MAX_KEY_LENGTH(64) bytes, password set \"%s\"\n",
                             __LINE__, &str[l]);
                         no = tn = 0;        /* reset tn */
                         return (1);
                     }
-                    strncpy(etab[no].loadcmd, &str[l], strlen(&str[l]));
+                    strncpy(etab[no].encryptkey, &str[l], strlen(&str[l]));
                     etab[no].encryptkey[strlen(&str[l])] = '\0';
                 } else {
                     fprintf(stderr, "odb [parseopt(%d)] - Error: unknown parameter \"%s\"\n",
@@ -14064,4 +14122,191 @@ static void usagexit()
         "      * print: default is Inserted Deleted Changed\n");
       /* Ruler       1         2         3         4         5         6         7         8*/
     exit( EX_OK );
+}
+
+static int AesEncryptFile (char * szSrc, char * szTarget, char * key, int iType)
+{
+    unsigned char ukey[EVP_MAX_KEY_LENGTH];
+    unsigned char iv[EVP_MAX_IV_LENGTH];
+    unsigned char in[ENCRYPT_MAX_LENGTH];
+    int inl; /* input length */
+    unsigned char out[ENCRYPT_MAX_LENGTH];
+    int outl; /* output length */
+    int isSuccess;
+    FILE *fpIn;
+    FILE *fpOut;
+    EVP_CIPHER_CTX ctx; /* evp context */
+    const EVP_CIPHER *cipher;
+    fpIn = fopen(szSrc,"rb");
+    if(fpIn==NULL)
+    {
+        printf("fopen szSrc failed");
+        return -1;
+    }
+
+    fpOut = fopen(szTarget,"w+");
+    if(fpOut==NULL)
+    {
+        printf("fopen szTarget failed");
+        fclose(fpIn);
+        return -1;
+    }
+
+    /* choose algorithm */
+    if(iType == 128)
+    {
+        cipher = EVP_aes_128_ecb();
+    }
+    else if(iType == 256)
+    {
+        cipher = EVP_aes_256_ecb();
+    }
+    else
+    {
+        printf("iType should be 128 or 256.");
+        fclose(fpIn);
+        fclose(fpOut);
+        return -1;
+    }
+
+    /* generate ukey and iv */
+    int len = sizeof(key);
+    EVP_BytesToKey(cipher,EVP_md5(),NULL,(const unsigned char *)key,len-1,1,ukey,iv);
+
+    /* initial ctx */
+    EVP_CIPHER_CTX_init(&ctx);
+    isSuccess = EVP_EncryptInit_ex(&ctx,cipher,NULL,ukey,iv);
+    if(!isSuccess)
+    {
+        printf("EVP_EncryptInit_ex() failed");
+        EVP_CIPHER_CTX_cleanup(&ctx);
+        fclose(fpIn);
+        fclose(fpOut);
+        return -1;
+    }
+
+    /* encrypt file */
+    for(;;)
+    {
+        inl = fread(in,1,ENCRYPT_MAX_LENGTH,fpIn);
+        if(inl<=0)
+        break;
+        isSuccess = EVP_EncryptUpdate(&ctx,out,&outl,in,inl);
+        if(!isSuccess)
+        {
+            printf("EVP_EncryptInit_ex() failed");
+            EVP_CIPHER_CTX_cleanup(&ctx);
+            fclose(fpIn);
+            fclose(fpOut);
+            return -1;
+        }
+        fwrite(out,1,outl,fpOut);
+    }
+    isSuccess = EVP_EncryptFinal_ex(&ctx,out,&outl);
+    if(!isSuccess)
+    {
+    printf("EVP_EncryptInit_ex() failed");
+    EVP_CIPHER_CTX_cleanup(&ctx);
+    fclose(fpIn);
+    fclose(fpOut);
+    return -1;
+    }
+    
+    fwrite(out,1,outl,fpOut);
+    printf("encrypt success!\n");
+    EVP_CIPHER_CTX_cleanup(&ctx);
+    fclose(fpIn);
+    fclose(fpOut);
+    return 0;
+}
+
+static int AesDecryptFile (char * szSrc, char * szTarget , char * key, int iType)
+{
+    unsigned char ukey[EVP_MAX_KEY_LENGTH];
+    unsigned char iv[EVP_MAX_IV_LENGTH];
+    unsigned char in[ENCRYPT_MAX_LENGTH];
+    int inl; /* input length */
+    unsigned char out[ENCRYPT_MAX_LENGTH];
+    int outl; /* output length */
+    int isSuccess;
+    FILE *fpIn;
+    FILE *fpOut;
+    EVP_CIPHER_CTX ctx; /* evp context */
+    const EVP_CIPHER *cipher;
+    fpIn = fopen(szSrc,"rb");
+    if(fpIn==NULL)
+    {
+        printf("fopen szSrc failed");
+        return -1;
+    }
+
+    fpOut = fopen(szTarget,"w+");
+    if(fpOut==NULL)
+    {
+        printf("fopen szTarget failed");
+        fclose(fpIn);
+        return -1;
+    }
+    /* choose algorithm */
+    if(iType == 128)
+    {
+        cipher = EVP_aes_128_ecb();
+    }
+    else if(iType == 256)
+    {
+        cipher = EVP_aes_256_ecb();
+    }
+    else
+    {
+        printf("iType should be 128 or 256.");
+        fclose(fpIn);
+        fclose(fpOut);
+        return -1;
+    }
+    /* generate ukey and iv */
+    int len = sizeof(key);
+    EVP_BytesToKey(cipher,EVP_md5(),NULL,(const unsigned char *)key,len-1,1,ukey,iv);
+    /* initial ctx */
+    EVP_CIPHER_CTX_init(&ctx);
+    isSuccess = EVP_DecryptInit_ex(&ctx,cipher,NULL,ukey,iv);
+    if(!isSuccess)
+    {
+        printf("EVP_DecryptInit_ex() failed");
+        EVP_CIPHER_CTX_cleanup(&ctx);
+        fclose(fpIn);
+        fclose(fpOut);
+        return -1;
+    }
+    /* decrypt file */
+    for(;;)
+    {
+        inl = fread(in,1,ENCRYPT_MAX_LENGTH,fpIn);
+        if(inl<=0)
+        break;
+        isSuccess = EVP_DecryptUpdate(&ctx,out,&outl,in,inl);
+        if(!isSuccess)
+        {
+            printf("EVP_EncryptInit_ex() failed");
+            EVP_CIPHER_CTX_cleanup(&ctx);
+            fclose(fpIn);
+            fclose(fpOut);
+            return -1;
+        }
+        fwrite(out,1,outl,fpOut);
+    }
+    isSuccess = EVP_DecryptFinal_ex(&ctx,out,&outl);
+    if(!isSuccess)
+    {
+        printf("EVP_DecryptInit_ex() failed");
+        EVP_CIPHER_CTX_cleanup(&ctx);
+        fclose(fpIn);
+        fclose(fpOut);
+        return -1;
+    }
+    fwrite(out,1,outl,fpOut);
+    printf("decrypt success\n");
+    EVP_CIPHER_CTX_cleanup(&ctx);
+    fclose(fpIn);
+    fclose(fpOut);
+    return 0;
 }
