@@ -69,6 +69,8 @@ char *odbauth = "Trafodion Dev <trafodion-development@lists.launchpad.net>";
 #define GZBUFF_LEN  262144      /* gzip write buffer length */
 
 #define ENCRYPT_MAX_LENGTH 1024
+#define BUFF_SIZE 10240
+#define SHA1_LENGTH 40
 
 #ifdef __CYGWIN__
     #undef WORD
@@ -143,6 +145,7 @@ char *odbauth = "Trafodion Dev <trafodion-development@lists.launchpad.net>";
     #include <pthread.h>
     #include <strings.h>
     #include <openssl/evp.h>
+    #include <openssl/sha.h>
 
     #ifdef __hpux
         #define Sleep(x) \
@@ -709,6 +712,9 @@ static void tunlock(void *eid);         /* Thread cleanup routine */
 
 static int AesEncryptFile (char * szSrc, char * szTarget, char * key, int iType);
 static int AesDecryptFile (char * szSrc, char * szTarget, char * key, int iType);
+static char* opensslSHA1File(char* filepath);
+static int copyFile(char* src, char* dst, double len);
+
 static void gclean(void);               /* Global cleanup routine */
 static int Oloadbuff(int eid);
 static int Ocopy(int eid);
@@ -6184,7 +6190,9 @@ static void Oload(int eid)
                                     -1 field to be ignored */
     FILE *fl=0,                 /* data to load file pointer */
          *fm=0,                 /* loadmap file pointer */
-         *fe=0;                 /* embed file pointer */
+         *fe=0,                 /* embed file pointer */
+         *fsha = 0;             /* match sha of encrypted file */
+    double flen = 0;
 #ifdef HDFS
     hdfsFile fhl = 0;           /* Hadoop Input File Handle */
 #endif
@@ -6192,7 +6200,9 @@ static void Oload(int eid)
          *gzbuff = 0,           /* GZIP IO buffer */
          *bp = 0,               /* used to browse line read from mapfile */
          *str = 0,              /* field buffer */
-         *sp = 0;               /* string pointer loop variable */
+         *sp = 0,               /* string pointer loop variable */
+         *encrypt_file_sha1_cal,  /* sha calculate from encrypted file */
+         *encrypt_file_sha1_read; /* sha read from encrypted file */
 
     struct m {                  /* Table Column Map */
         int min;                /* min value */
@@ -6220,6 +6230,7 @@ static void Oload(int eid)
     time_t trnd;                /* to generate random time/timestamp(s) */
     char num[32];               /* Formatted Number String */
     char tim[15];               /* Formatted Time String */
+    char no_sha_file[ENCRYPT_MAX_LENGTH] = {0};     /* tmp file to store encrypted file without sha */
     char decrypt_file[ENCRYPT_MAX_LENGTH] = {0};     /* tmp file to store decrypted file */
     struct timeval tve;         /* timeval struct to define elapesd/timelines */
     SQLCHAR *Odp = 0;           /* rowset buffer data pointer */
@@ -6373,6 +6384,49 @@ static void Oload(int eid)
         /* decrypt file first if set option "encryptkey" */
         if ( strlen(etab[eid].encryptkey) > 0)
         {
+            encrypt_file_sha1_read = malloc(SHA_DIGEST_LENGTH * 4 *sizeof(char));
+            encrypt_file_sha1_cal = malloc(SHA_DIGEST_LENGTH * 4 *sizeof(char));
+            
+            /* read sha from end of encrypted file */        
+            if ((fsha = fopen(buff, "a+"))==(FILE *)NULL) {
+                fprintf(stderr,"odb [Oload(%d)] - Error opening in file %s: [%d] %s\n",
+                    __LINE__, buff, errno, strerror(errno) );
+                return (-1);
+            }
+
+            fseek(fsha, -40L, SEEK_END);
+            flen = ftell(fsha);
+            printf("input file len = %ld\n", flen);
+            fread(encrypt_file_sha1_read, 1, SHA1_LENGTH, fsha);
+            encrypt_file_sha1_read[SHA1_LENGTH] = '\0';            
+            printf("encrypt_file_sha1_read = %s\n", encrypt_file_sha1_read);
+
+            /* delete the sha in the end of encrypted file */
+            fseek(fsha, 0L, SEEK_SET);
+            strcat(no_sha_file,  buff);
+            strcat(no_sha_file, "_no_sha");
+            ret = copyFile(buff, no_sha_file, flen);
+            if (ret != 0)
+            {
+                printf("delete sha in the end of encrypted file failed\n");
+                goto oload_exit;
+            }
+            strcpy(buff, no_sha_file);
+            if ( fsha ) 
+                fclose ( fsha );
+                        
+            /* calculate sha of encrypted file */
+            encrypt_file_sha1_cal = malloc(SHA_DIGEST_LENGTH * 4 *sizeof(char));
+            strcpy(encrypt_file_sha1_cal, opensslSHA1File(buff));
+            printf("encrypt_file_sha1_cal = %s\n", encrypt_file_sha1_cal);
+        
+            /* match the sha of read and calculate */
+            if (strcmp(encrypt_file_sha1_read, encrypt_file_sha1_cal) != 0)
+            {
+                printf ("match sha code failed, maybe the file is damaged\n");
+                goto oload_exit;
+            }            
+
             strcat(decrypt_file,  buff);
             strcat(decrypt_file, "_decrypted");
             ret = AesDecryptFile(buff, decrypt_file, etab[eid].encryptkey, 128);
@@ -7897,9 +7951,14 @@ static void Oload(int eid)
         etab[eid].flg2 &= ~020000000 ;          /* reset Oexec to allocate/use its own handle */
     }
 
-    /* remove decrypted file */
+    /* remove tmp files */
     if ( strlen(etab[eid].encryptkey) > 0)
     {
+        if (!access(no_sha_file, F_OK))
+        {
+            remove(no_sha_file);
+        }
+
         if (!access(decrypt_file, F_OK))
         {
             remove(decrypt_file);
@@ -9647,7 +9706,8 @@ static void Oextract(int eid)
     int tid = etab[eid].id;     /* Thread ID */
     char num[32];               /* to build formatted numbers */
     char tim[15];               /* formatted time string */
-    char encrypt_file[ENCRYPT_MAX_LENGTH] = {0};     /* tmp file to store encrypted file */
+    char encrypt_file[ENCRYPT_MAX_LENGTH] = {0};             /* tmp file to store encrypted file */
+	char *encrypt_file_sha1;     /* sha of encrypted file */
     char *xbuff = 0;            /* buffer allocated for XML output */
     size_t xbuffl = 33 + MAXOBJ_LEN * 3 ;   /* xmlbuff length */
     SQLCHAR *Ocmd = 0;          /* ODBC Command buffer */
@@ -9930,6 +9990,7 @@ static void Oextract(int eid)
                 fclose ( etab[eid].fo );
         }
 
+        /* if set option encryptkey, encrypt the file after extract */
         if ( strlen(etab[eid].encryptkey) > 0)
         {
             strcat(encrypt_file,  etab[eid].tgt);
@@ -9943,7 +10004,26 @@ static void Oextract(int eid)
 
             remove(etab[eid].tgt);
             rename(encrypt_file, etab[eid].tgt);
-        }
+
+	        /* calculate sha of encrypted file */
+	 		encrypt_file_sha1 = malloc(SHA_DIGEST_LENGTH * 4 *sizeof(char));
+	        strcpy(encrypt_file_sha1, opensslSHA1File(etab[eid].tgt));
+	        printf("extracted file sha1 code : %s\n", encrypt_file_sha1);
+
+			/* write sha to the end of encrypted file */		
+			if ((etab[eid].fo=fopen(etab[eid].tgt, "a+"))==(FILE *)NULL) {
+				fprintf(stderr,"odb [Oextract(%d)] - Error opening out file %s: [%d] %s\n",
+					__LINE__, etab[eid].tgt, errno, strerror(errno) );
+				return (-1);
+			}
+			
+	        if ( ( fwrite ( encrypt_file_sha1, 1, strlen(encrypt_file_sha1), etab[eid].fo ) ) != strlen(encrypt_file_sha1) )
+	            fprintf(stderr, "odb [Oextract(%d)] - Warning fwrite wrote sha to encrypted file: %s",
+	                __LINE__, strerror(errno));		
+
+	        if ( etab[eid].fo && etab[eid].fo != stdout ) 
+	            fclose ( etab[eid].fo );
+		}
 
         /* Print stats */
         if ( etab[eid].flg2 & 04000000 ) {  /* initialize XML output buffer */
@@ -14137,14 +14217,14 @@ static int AesEncryptFile (char * szSrc, char * szTarget, char * key, int iType)
     FILE *fpOut;
     EVP_CIPHER_CTX ctx; /* evp context */
     const EVP_CIPHER *cipher;
-    fpIn = fopen(szSrc,"rb");
+    fpIn = fopen(szSrc, "rb");
     if(fpIn==NULL)
     {
         printf("fopen szSrc failed");
         return -1;
     }
 
-    fpOut = fopen(szTarget,"w+");
+    fpOut = fopen(szTarget, "w+");
     if(fpOut==NULL)
     {
         printf("fopen szTarget failed");
@@ -14171,11 +14251,11 @@ static int AesEncryptFile (char * szSrc, char * szTarget, char * key, int iType)
 
     /* generate ukey and iv */
     int len = sizeof(key);
-    EVP_BytesToKey(cipher,EVP_md5(),NULL,(const unsigned char *)key,len-1,1,ukey,iv);
+    EVP_BytesToKey(cipher, EVP_md5(), NULL, (const unsigned char *)key, len - 1, 1, ukey, iv);
 
     /* initial ctx */
     EVP_CIPHER_CTX_init(&ctx);
-    isSuccess = EVP_EncryptInit_ex(&ctx,cipher,NULL,ukey,iv);
+    isSuccess = EVP_EncryptInit_ex(&ctx, cipher, NULL, ukey, iv);
     if(!isSuccess)
     {
         printf("EVP_EncryptInit_ex() failed");
@@ -14188,10 +14268,10 @@ static int AesEncryptFile (char * szSrc, char * szTarget, char * key, int iType)
     /* encrypt file */
     for(;;)
     {
-        inl = fread(in,1,ENCRYPT_MAX_LENGTH,fpIn);
-        if(inl<=0)
+        inl = fread(in, 1, ENCRYPT_MAX_LENGTH, fpIn);
+        if(inl <= 0)
         break;
-        isSuccess = EVP_EncryptUpdate(&ctx,out,&outl,in,inl);
+        isSuccess = EVP_EncryptUpdate(&ctx, out, &outl, in, inl);
         if(!isSuccess)
         {
             printf("EVP_EncryptInit_ex() failed");
@@ -14200,9 +14280,9 @@ static int AesEncryptFile (char * szSrc, char * szTarget, char * key, int iType)
             fclose(fpOut);
             return -1;
         }
-        fwrite(out,1,outl,fpOut);
+        fwrite(out, 1, outl, fpOut);
     }
-    isSuccess = EVP_EncryptFinal_ex(&ctx,out,&outl);
+    isSuccess = EVP_EncryptFinal_ex(&ctx, out, &outl);
     if(!isSuccess)
     {
     printf("EVP_EncryptInit_ex() failed");
@@ -14233,14 +14313,14 @@ static int AesDecryptFile (char * szSrc, char * szTarget , char * key, int iType
     FILE *fpOut;
     EVP_CIPHER_CTX ctx; /* evp context */
     const EVP_CIPHER *cipher;
-    fpIn = fopen(szSrc,"rb");
+    fpIn = fopen(szSrc, "rb");
     if(fpIn==NULL)
     {
         printf("fopen szSrc failed");
         return -1;
     }
 
-    fpOut = fopen(szTarget,"w+");
+    fpOut = fopen(szTarget, "w+");
     if(fpOut==NULL)
     {
         printf("fopen szTarget failed");
@@ -14265,10 +14345,10 @@ static int AesDecryptFile (char * szSrc, char * szTarget , char * key, int iType
     }
     /* generate ukey and iv */
     int len = sizeof(key);
-    EVP_BytesToKey(cipher,EVP_md5(),NULL,(const unsigned char *)key,len-1,1,ukey,iv);
+    EVP_BytesToKey(cipher, EVP_md5(), NULL, (const unsigned char *)key, len - 1, 1, ukey, iv);
     /* initial ctx */
     EVP_CIPHER_CTX_init(&ctx);
-    isSuccess = EVP_DecryptInit_ex(&ctx,cipher,NULL,ukey,iv);
+    isSuccess = EVP_DecryptInit_ex(&ctx, cipher, NULL, ukey, iv);
     if(!isSuccess)
     {
         printf("EVP_DecryptInit_ex() failed");
@@ -14280,10 +14360,10 @@ static int AesDecryptFile (char * szSrc, char * szTarget , char * key, int iType
     /* decrypt file */
     for(;;)
     {
-        inl = fread(in,1,ENCRYPT_MAX_LENGTH,fpIn);
-        if(inl<=0)
+        inl = fread(in, 1, ENCRYPT_MAX_LENGTH, fpIn);
+        if(inl <= 0)
         break;
-        isSuccess = EVP_DecryptUpdate(&ctx,out,&outl,in,inl);
+        isSuccess = EVP_DecryptUpdate(&ctx, out, &outl, in, inl);
         if(!isSuccess)
         {
             printf("EVP_EncryptInit_ex() failed");
@@ -14292,9 +14372,9 @@ static int AesDecryptFile (char * szSrc, char * szTarget , char * key, int iType
             fclose(fpOut);
             return -1;
         }
-        fwrite(out,1,outl,fpOut);
+        fwrite(out, 1, outl, fpOut);
     }
-    isSuccess = EVP_DecryptFinal_ex(&ctx,out,&outl);
+    isSuccess = EVP_DecryptFinal_ex(&ctx, out, &outl);
     if(!isSuccess)
     {
         printf("EVP_DecryptInit_ex() failed");
@@ -14303,10 +14383,77 @@ static int AesDecryptFile (char * szSrc, char * szTarget , char * key, int iType
         fclose(fpOut);
         return -1;
     }
-    fwrite(out,1,outl,fpOut);
+    fwrite(out, 1, outl, fpOut);
     printf("decrypt success\n");
     EVP_CIPHER_CTX_cleanup(&ctx);
     fclose(fpIn);
     fclose(fpOut);
     return 0;
 }
+
+static char* opensslSHA1File(char* filepath)
+{
+    int i = 0;
+    FILE * fp = fopen(filepath, "rb");
+    size_t nread;
+    SHA_CTX ctx;
+    unsigned char buffin[BUFF_SIZE];
+    unsigned char sha1_digest[SHA_DIGEST_LENGTH] = {0};
+    char* buffout = (char *)malloc(SHA_DIGEST_LENGTH * 4 *sizeof(char));
+
+    if (!fp) {
+        printf("Could not open file: %s\n", filepath);
+        return "";
+    }
+
+    SHA1_Init(&ctx);
+
+    while (nread = fread(buffin, 1, BUFF_SIZE, fp)) {
+        SHA1_Update(&ctx, buffin, nread);
+    }
+
+    SHA1_Final(sha1_digest, &ctx);
+    fclose(fp);
+
+    for (i = 0; i < SHA_DIGEST_LENGTH; i++)
+        sprintf(buffout + i * 2, "%02x", sha1_digest[i]);
+
+    return buffout;
+}
+
+static int copyFile(char* src, char* dst, double len)
+{    
+    FILE *in;
+    FILE *out;
+    void* buf;
+    int buffer = 0;
+    int rl = 0;
+    double sum = 0;
+
+    buffer = 1024;
+    printf("copy buffer = %d\n", buffer);
+    
+    in = fopen(src, "rb");
+    out = fopen(dst, "wb");
+    
+    while(sum < len)
+    {
+    if (len - sum < buffer)       
+    {
+        rl = fread(&buf, 1, len - sum, in);
+    }
+    else
+    {
+        rl = fread(&buf, 1, buffer, in);
+    }
+    
+        fwrite(&buf, 1, rl, out);
+        sum += rl;
+    }
+    
+    fclose(in);
+    fclose(out);
+    
+    return 0;
+}
+
